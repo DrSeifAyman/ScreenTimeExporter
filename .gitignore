@@ -1,0 +1,13 @@
+.gradle/
+local.properties
+.idea/
+*.iml
+build/
+app/build/
+.DS_Store
+
+jdk17/
+jdk-17.0.2/
+*.zip
+*.jks
+hs_err_*.log
