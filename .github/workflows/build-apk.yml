@@ -40,9 +40,11 @@ jobs:
           git pull --rebase || true
           git push
 
-      - name: Upload APK
+      - name: Upload Artifacts
         uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: ScreenTimeExporter-APK
-          path: app/build/outputs/apk/release/app-release.apk
-          if-no-files-found: error
+          name: ScreenTimeExporter-Artifacts
+          path: |
+            app/build/outputs/apk/release/app-release.apk
+            build.log
