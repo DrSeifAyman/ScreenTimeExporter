@@ -26,6 +26,7 @@ import java.util.concurrent.Executors;
 final class GoogleDriveUploader {
     private static final String PREFS = "screen_time_exporter";
     private static final String LAST_UPLOAD_KEY = "last_upload_status";
+    private static final String LAST_UPLOAD_SUCCESS_TIME = "last_upload_success_time";
     private static final String DRIVE_FOLDER_KEY = "drive_folder_name";
     private static final ExecutorService EXECUTOR = Executors.newSingleThreadExecutor();
 
@@ -33,6 +34,10 @@ final class GoogleDriveUploader {
 
     static String getLastUploadStatus(Context context) {
         return prefs(context).getString(LAST_UPLOAD_KEY, "No upload yet");
+    }
+
+    static long getLastUploadSuccessTime(Context context) {
+        return prefs(context).getLong(LAST_UPLOAD_SUCCESS_TIME, 0L);
     }
 
     static void setDriveFolderName(Context context, String folderName) {
@@ -108,7 +113,12 @@ final class GoogleDriveUploader {
                 String status = success
                         ? "Uploaded " + file.getName() + " successfully"
                         : "Failed to upload " + file.getName();
-                prefs(context).edit().putString(LAST_UPLOAD_KEY, status).apply();
+                SharedPreferences.Editor editor = prefs(context).edit();
+                editor.putString(LAST_UPLOAD_KEY, status);
+                if (success) {
+                    editor.putLong(LAST_UPLOAD_SUCCESS_TIME, System.currentTimeMillis());
+                }
+                editor.apply();
                 if (callback != null) callback.onResult(success, status);
             } catch (Exception e) {
                 String status = "Upload error: " + e.getMessage();

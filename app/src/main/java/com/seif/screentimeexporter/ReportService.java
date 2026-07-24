@@ -5,6 +5,8 @@ import android.content.Context;
 import android.content.Intent;
 import android.os.PowerManager;
 import android.util.Log;
+import android.content.pm.ServiceInfo;
+import android.os.Build;
 
 /**
  * Background IntentService that handles all heavy work off the main thread.
@@ -34,6 +36,12 @@ public final class ReportService extends IntentService {
         wl.acquire(5 * 60 * 1000L); // 5 minute max
 
         try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(1, NotificationHelper.getForegroundNotification(this), ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
+            } else {
+                startForeground(1, NotificationHelper.getForegroundNotification(this));
+            }
+
             String action = intent.getAction();
             if (action == null) return;
 
@@ -53,6 +61,7 @@ public final class ReportService extends IntentService {
             }
         } finally {
             if (wl.isHeld()) wl.release();
+            stopForeground(true);
         }
     }
 
@@ -60,14 +69,17 @@ public final class ReportService extends IntentService {
         try {
             UsageReportGenerator.generateMasterReport(this);
             ReportScheduler.markLocalSuccess(this);
+            ReportScheduler.clearLastLocalError(this);
             NotificationHelper.sendNotification(this,
                     "Local Export Complete",
                     "Screen time report saved locally.");
         } catch (Exception e) {
             Log.e(TAG, "Failed local generation", e);
+            String errorMsg = e.getMessage() != null ? e.getMessage() : "Unknown error";
+            ReportScheduler.setLastLocalError(this, errorMsg);
             NotificationHelper.sendNotification(this,
-                    "Local Export Failed",
-                    "Error: " + e.getMessage());
+                    "\u274C Local Export Failed",
+                    "Error: " + errorMsg);
         } finally {
             ReportScheduler.scheduleNext(this);
         }
@@ -77,6 +89,7 @@ public final class ReportService extends IntentService {
         try {
             UsageReportGenerator.ReportResult result = UsageReportGenerator.generateMasterReport(this);
             ReportScheduler.markLocalSuccess(this);
+            ReportScheduler.clearLastLocalError(this);
 
             // Synchronous upload with callback
             final Object lock = new Object();
@@ -87,17 +100,18 @@ public final class ReportService extends IntentService {
                     uploadResult[0] = success;
                     if (success) {
                         ReportScheduler.markDriveSuccess(ReportService.this);
+                        ReportScheduler.clearLastDriveError(ReportService.this);
                         NotificationHelper.sendNotification(ReportService.this,
                                 "Drive Upload Complete",
                                 "Report uploaded to Google Drive.");
                     } else {
+                        String errorMsg = msg != null ? msg : "Unknown upload error";
+                        ReportScheduler.setLastDriveError(ReportService.this, errorMsg);
                         ReportScheduler.incrementRetryCount(ReportService.this);
                         int attempt = ReportScheduler.getDriveRetryCount(ReportService.this);
-                        if (attempt % 3 == 1 || attempt == 1) {
-                            NotificationHelper.sendNotification(ReportService.this,
-                                    "Drive Upload Failed",
-                                    "Attempt #" + attempt + " failed. Retrying in 30 min...");
-                        }
+                        NotificationHelper.sendNotification(ReportService.this,
+                                "\u274C Drive Upload Failed",
+                                "Attempt #" + attempt + ": " + errorMsg + ". Retrying in 30 min...");
                         ReportScheduler.scheduleRetry(ReportService.this);
                     }
                     lock.notify();
@@ -110,7 +124,13 @@ public final class ReportService extends IntentService {
             }
         } catch (Exception e) {
             Log.e(TAG, "Failed drive upload", e);
+            String errorMsg = e.getMessage() != null ? e.getMessage() : "Unknown error";
+            ReportScheduler.setLastDriveError(this, errorMsg);
             ReportScheduler.incrementRetryCount(this);
+            int attempt = ReportScheduler.getDriveRetryCount(this);
+            NotificationHelper.sendNotification(this,
+                    "\u274C Drive Upload Failed",
+                    "Attempt #" + attempt + ": " + errorMsg + ". Retrying in 30 min...");
             ReportScheduler.scheduleRetry(this);
         } finally {
             ReportScheduler.scheduleNext(this);
@@ -131,11 +151,18 @@ public final class ReportService extends IntentService {
                 synchronized (lock) {
                     if (success) {
                         ReportScheduler.markDriveSuccess(ReportService.this);
+                        ReportScheduler.clearLastDriveError(ReportService.this);
                         NotificationHelper.sendNotification(ReportService.this,
-                                "Drive Upload Recovered",
+                                "\u2705 Drive Upload Recovered",
                                 "Report uploaded successfully after retry.");
                     } else {
+                        String errorMsg = msg != null ? msg : "Unknown upload error";
+                        ReportScheduler.setLastDriveError(ReportService.this, errorMsg);
                         ReportScheduler.incrementRetryCount(ReportService.this);
+                        int attempt = ReportScheduler.getDriveRetryCount(ReportService.this);
+                        NotificationHelper.sendNotification(ReportService.this,
+                                "\u274C Drive Retry Failed",
+                                "Attempt #" + attempt + ": " + errorMsg + ". Retrying...");
                         ReportScheduler.scheduleRetry(ReportService.this);
                     }
                     lock.notify();
@@ -147,7 +174,13 @@ public final class ReportService extends IntentService {
             }
         } catch (Exception e) {
             Log.e(TAG, "Retry failed", e);
+            String errorMsg = e.getMessage() != null ? e.getMessage() : "Unknown error";
+            ReportScheduler.setLastDriveError(this, errorMsg);
             ReportScheduler.incrementRetryCount(this);
+            int attempt = ReportScheduler.getDriveRetryCount(this);
+            NotificationHelper.sendNotification(this,
+                    "\u274C Drive Retry Failed",
+                    "Attempt #" + attempt + ": " + errorMsg);
             ReportScheduler.scheduleRetry(this);
         }
     }
@@ -156,30 +189,41 @@ public final class ReportService extends IntentService {
         try {
             UsageReportGenerator.ReportResult result = UsageReportGenerator.generateMasterReport(this);
             ReportScheduler.markLocalSuccess(this);
+            ReportScheduler.clearLastLocalError(this);
             Log.i(TAG, "Interval sync: local report updated.");
 
-            // Also try Drive if signed in and not done today
-            if (!ReportScheduler.isDriveDoneToday(this)) {
-                com.google.android.gms.auth.api.signin.GoogleSignInAccount account =
-                        com.google.android.gms.auth.api.signin.GoogleSignIn.getLastSignedInAccount(this);
-                if (account != null) {
-                    final Object lock = new Object();
-                    GoogleDriveUploader.uploadFileAsync(this, result.csvFile, (success, msg) -> {
-                        synchronized (lock) {
-                            if (success) {
-                                ReportScheduler.markDriveSuccess(ReportService.this);
-                                Log.i(TAG, "Interval sync: Drive upload success.");
-                            }
-                            lock.notify();
-                        }
-                    });
+            // Also try Drive if signed in
+            com.google.android.gms.auth.api.signin.GoogleSignInAccount account =
+                    com.google.android.gms.auth.api.signin.GoogleSignIn.getLastSignedInAccount(this);
+            if (account != null) {
+                final Object lock = new Object();
+                GoogleDriveUploader.uploadFileAsync(this, result.csvFile, (success, msg) -> {
                     synchronized (lock) {
-                        lock.wait(4 * 60 * 1000L);
+                        if (success) {
+                            ReportScheduler.markDriveSuccess(ReportService.this);
+                            ReportScheduler.clearLastDriveError(ReportService.this);
+                            Log.i(TAG, "Interval sync: Drive upload success.");
+                        } else {
+                            String errorMsg = msg != null ? msg : "Unknown upload error";
+                            ReportScheduler.setLastDriveError(ReportService.this, errorMsg);
+                            NotificationHelper.sendNotification(ReportService.this,
+                                    "\u274C Interval Drive Upload Failed",
+                                    errorMsg);
+                        }
+                        lock.notify();
                     }
+                });
+                synchronized (lock) {
+                    lock.wait(4 * 60 * 1000L);
                 }
             }
         } catch (Exception e) {
             Log.e(TAG, "Interval sync failed", e);
+            String errorMsg = e.getMessage() != null ? e.getMessage() : "Unknown error";
+            ReportScheduler.setLastLocalError(this, errorMsg);
+            NotificationHelper.sendNotification(this,
+                    "\u274C Interval Sync Failed",
+                    errorMsg);
         } finally {
             ReportScheduler.scheduleNextInterval(this);
         }

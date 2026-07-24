@@ -7,6 +7,7 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.os.Build;
 import android.util.Log;
+import androidx.core.content.ContextCompat;
 
 import java.text.SimpleDateFormat;
 import java.util.Calendar;
@@ -36,7 +37,12 @@ final class ReportScheduler {
     // Success tracking keys
     private static final String LAST_LOCAL_SUCCESS_DATE = "last_local_success_date";
     private static final String LAST_DRIVE_SUCCESS_DATE = "last_drive_success_date";
+    private static final String LAST_LOCAL_SUCCESS_TIME = "last_local_success_time_ms";
+    private static final String LAST_DRIVE_SUCCESS_TIME = "last_drive_success_time_ms";
+    private static final String NEXT_INTERVAL_TIME = "next_interval_time_ms";
     private static final String DRIVE_RETRY_COUNT = "drive_retry_count";
+    private static final String LAST_LOCAL_ERROR = "last_local_error";
+    private static final String LAST_DRIVE_ERROR = "last_drive_error";
 
     private static final int REQUEST_CODE_LOCAL = 1001;
     private static final int REQUEST_CODE_DRIVE = 1002;
@@ -107,14 +113,50 @@ final class ReportScheduler {
     }
 
     static void markLocalSuccess(Context context) {
-        prefs(context).edit().putString(LAST_LOCAL_SUCCESS_DATE, todayDateString()).apply();
+        prefs(context).edit()
+                .putString(LAST_LOCAL_SUCCESS_DATE, todayDateString())
+                .putLong(LAST_LOCAL_SUCCESS_TIME, System.currentTimeMillis())
+                .apply();
     }
 
     static void markDriveSuccess(Context context) {
         prefs(context).edit()
                 .putString(LAST_DRIVE_SUCCESS_DATE, todayDateString())
+                .putLong(LAST_DRIVE_SUCCESS_TIME, System.currentTimeMillis())
                 .putInt(DRIVE_RETRY_COUNT, 0)
                 .apply();
+    }
+
+    static long getLastLocalSuccessTime(Context context) {
+        return prefs(context).getLong(LAST_LOCAL_SUCCESS_TIME, 0L);
+    }
+
+    static long getLastDriveSuccessTime(Context context) {
+        return prefs(context).getLong(LAST_DRIVE_SUCCESS_TIME, 0L);
+    }
+
+    static void setLastLocalError(Context context, String error) {
+        prefs(context).edit().putString(LAST_LOCAL_ERROR, error).apply();
+    }
+
+    static String getLastLocalError(Context context) {
+        return prefs(context).getString(LAST_LOCAL_ERROR, "");
+    }
+
+    static void clearLastLocalError(Context context) {
+        prefs(context).edit().remove(LAST_LOCAL_ERROR).apply();
+    }
+
+    static void setLastDriveError(Context context, String error) {
+        prefs(context).edit().putString(LAST_DRIVE_ERROR, error).apply();
+    }
+
+    static String getLastDriveError(Context context) {
+        return prefs(context).getString(LAST_DRIVE_ERROR, "");
+    }
+
+    static void clearLastDriveError(Context context) {
+        prefs(context).edit().remove(LAST_DRIVE_ERROR).apply();
     }
 
     static boolean isLocalDoneToday(Context context) {
@@ -210,6 +252,9 @@ final class ReportScheduler {
         } catch (SecurityException e) {
             alarmManager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, nextTime, piInterval);
         }
+
+        // Save the next interval time for UI
+        prefs(context).edit().putLong(NEXT_INTERVAL_TIME, nextTime).apply();
     }
 
     private static void cancelInterval(Context context) {
@@ -217,7 +262,13 @@ final class ReportScheduler {
         if (alarmManager == null) return;
         PendingIntent piInterval = createPendingIntent(context, ACTION_INTERVAL, REQUEST_CODE_INTERVAL);
         alarmManager.cancel(piInterval);
+        prefs(context).edit().putLong(NEXT_INTERVAL_TIME, 0L).apply();
         Log.i(TAG, "Interval sync cancelled.");
+    }
+
+    static long getNextIntervalMs(Context context) {
+        if (!isIntervalEnabled(context)) return 0L;
+        return prefs(context).getLong(NEXT_INTERVAL_TIME, 0L);
     }
 
     static void scheduleRetry(Context context) {
@@ -319,6 +370,6 @@ final class ReportScheduler {
         // Start the service for drive upload
         Intent serviceIntent = new Intent(context, ReportService.class);
         serviceIntent.setAction(ReportService.ACTION_DRIVE);
-        context.startService(serviceIntent);
+        ContextCompat.startForegroundService(context, serviceIntent);
     }
 }

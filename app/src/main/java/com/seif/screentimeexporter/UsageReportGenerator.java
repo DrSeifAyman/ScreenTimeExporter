@@ -31,9 +31,25 @@ import java.util.TimeZone;
 final class UsageReportGenerator {
     static final String OUTPUT_FOLDER = "Seif Health/ScreenTime";
     private static final long DAY_MS = 24L * 60L * 60L * 1000L;
-    private static final long MIN_DURATION_MS = 1000L;
+    private static final long MIN_DURATION_MS = 1000L; // Ignore sessions less than 1 second
 
     private UsageReportGenerator() {}
+
+    static final class SessionRecord {
+        String packageName;
+        String appName;
+        String category;
+        long sessionStartMs;
+        long sessionEndMs;
+        long durationMs;
+
+        SessionRecord(String pkg, long start, long end, long duration) {
+            this.packageName = pkg;
+            this.sessionStartMs = start;
+            this.sessionEndMs = end;
+            this.durationMs = duration;
+        }
+    }
 
     static String todayKey() {
         return dateKey(System.currentTimeMillis());
@@ -43,22 +59,6 @@ final class UsageReportGenerator {
         Calendar c = Calendar.getInstance();
         c.add(Calendar.DAY_OF_YEAR, -1);
         return dateKey(c.getTimeInMillis());
-    }
-
-    static String previousDayKey(String key) throws Exception {
-        Calendar c = parseDateKey(key);
-        c.add(Calendar.DAY_OF_YEAR, -1);
-        return dateKey(c.getTimeInMillis());
-    }
-
-    static String nextDayKey(String key) throws Exception {
-        Calendar c = parseDateKey(key);
-        c.add(Calendar.DAY_OF_YEAR, 1);
-        return dateKey(c.getTimeInMillis());
-    }
-
-    static int compareDateKeys(String a, String b) {
-        return a.compareTo(b);
     }
 
     private static final String PREFS = "screen_time_exporter";
@@ -88,26 +88,55 @@ final class UsageReportGenerator {
         return primary;
     }
 
+    // This method aggregates SessionRecords into AppUsageRecords for the UI list
     static List<AppUsageRecord> getTodayTopApps(Context context) {
         try {
             String key = todayKey();
             Calendar startCalendar = parseDateKey(key);
-            return queryDayRecords(context, startCalendar.getTimeInMillis(), System.currentTimeMillis());
+            List<SessionRecord> sessions = queryDaySessions(context, startCalendar.getTimeInMillis(), System.currentTimeMillis());
+            return aggregateSessions(sessions);
         } catch (Exception e) {
             return Collections.emptyList();
         }
     }
 
+    // This method aggregates SessionRecords into AppUsageRecords for the UI list
     static List<AppUsageRecord> getYesterdayTopApps(Context context) {
         try {
             String key = yesterdayKey();
             Calendar startCalendar = parseDateKey(key);
             Calendar endCalendar = (Calendar) startCalendar.clone();
             endCalendar.add(Calendar.DAY_OF_YEAR, 1);
-            return queryDayRecords(context, startCalendar.getTimeInMillis(), endCalendar.getTimeInMillis());
+            List<SessionRecord> sessions = queryDaySessions(context, startCalendar.getTimeInMillis(), endCalendar.getTimeInMillis());
+            return aggregateSessions(sessions);
         } catch (Exception e) {
             return Collections.emptyList();
         }
+    }
+
+    static List<AppUsageRecord> aggregateSessions(List<SessionRecord> sessions) {
+        Map<String, AppUsageRecord> map = new HashMap<>();
+        for (SessionRecord s : sessions) {
+            AppUsageRecord r = map.get(s.packageName);
+            if (r == null) {
+                r = new AppUsageRecord(s.packageName);
+                r.appName = s.appName;
+                r.category = s.category;
+                map.put(s.packageName, r);
+            }
+            r.durationMs += s.durationMs;
+            r.launches++; // Each session counts as a launch
+        }
+        List<AppUsageRecord> list = new ArrayList<>(map.values());
+        Collections.sort(list, new Comparator<AppUsageRecord>() {
+            @Override
+            public int compare(AppUsageRecord a, AppUsageRecord b) {
+                int byDuration = Long.compare(b.durationMs, a.durationMs);
+                if (byDuration != 0) return byDuration;
+                return a.appName.compareToIgnoreCase(b.appName);
+            }
+        });
+        return list;
     }
 
     static ReportResult generateFullDay(Context context, String dayKey) throws Exception {
@@ -120,7 +149,7 @@ final class UsageReportGenerator {
 
     static int generateAllHistory(Context context) throws Exception {
         ReportResult result = generateMasterReport(context);
-        return result.appCount;
+        return result.sessionCount;
     }
 
     static ReportResult generateMasterReport(Context context) throws Exception {
@@ -142,9 +171,9 @@ final class UsageReportGenerator {
             if (end <= start) continue;
 
             try {
-                List<AppUsageRecord> dayRecords = queryDayRecords(context, start, end);
-                for (AppUsageRecord r : dayRecords) {
-                    masterList.add(new MasterRecord(dayKey, r));
+                List<SessionRecord> daySessions = queryDaySessions(context, start, end);
+                for (SessionRecord s : daySessions) {
+                    masterList.add(new MasterRecord(dayKey, s));
                 }
             } catch (Exception ignored) {}
         }
@@ -161,7 +190,7 @@ final class UsageReportGenerator {
         cleanupExtraFilesExceptMasterCsv(dir);
 
         long totalMs = 0L;
-        for (MasterRecord r : masterList) totalMs += r.record.durationMs;
+        for (MasterRecord r : masterList) totalMs += r.session.durationMs;
 
         return new ReportResult(todayKey(), masterList.size(), totalMs, masterCsv, masterCsv, masterCsv);
     }
@@ -176,7 +205,7 @@ final class UsageReportGenerator {
         }
     }
 
-    static List<AppUsageRecord> queryDayRecords(Context context, long start, long end) throws Exception {
+    static List<SessionRecord> queryDaySessions(Context context, long start, long end) throws Exception {
         if (!PermissionUtils.hasUsageAccess(context)) {
             throw new IllegalStateException("Usage Access is not granted");
         }
@@ -193,14 +222,14 @@ final class UsageReportGenerator {
             throw new IllegalStateException("UsageStatsManager is unavailable");
         }
 
-                long queryStart = Math.max(0L, start - DAY_MS);
+        long queryStart = Math.max(0L, start - DAY_MS);
         long queryEnd = end + DAY_MS;
         android.app.usage.UsageEvents events = manager.queryEvents(queryStart, queryEnd);
         if (events == null) {
             return java.util.Collections.emptyList();
         }
 
-        java.util.Map<String, AppUsageRecord> records = new java.util.HashMap<>();
+        java.util.List<SessionRecord> sessions = new java.util.ArrayList<>();
 
         String currentApp = null;
         long startTime = 0L;
@@ -216,123 +245,104 @@ final class UsageReportGenerator {
             if (type == android.app.usage.UsageEvents.Event.MOVE_TO_FOREGROUND) {
                 if (currentApp != null) {
                     if (!currentApp.equals(pkg)) {
-                        addDuration(records, currentApp, startTime, ts, start, end);
+                        addSession(sessions, currentApp, startTime, ts, start, end);
                         currentApp = pkg;
                         startTime = ts;
-                        if (ts >= start && ts < end) getRecord(records, pkg).launches++;
                     }
                 } else {
                     currentApp = pkg;
                     startTime = ts;
-                    if (ts >= start && ts < end) getRecord(records, pkg).launches++;
                 }
             } else if (type == android.app.usage.UsageEvents.Event.MOVE_TO_BACKGROUND) {
                 if (currentApp != null && currentApp.equals(pkg)) {
-                    addDuration(records, currentApp, startTime, ts, start, end);
+                    addSession(sessions, currentApp, startTime, ts, start, end);
                     currentApp = null;
                 }
             } else if (type == 16 || type == 26 || type == 18) { // SCREEN_NON_INTERACTIVE, DEVICE_SHUTDOWN, or KEYGUARD_SHOWN
                 if (currentApp != null) {
-                    addDuration(records, currentApp, startTime, ts, start, end);
+                    addSession(sessions, currentApp, startTime, ts, start, end);
                     currentApp = null;
                 }
             }
-            // type == 20 (KEYGUARD_HIDDEN) is functionally identical to the next ACTIVITY_RESUMED
-            // which will trigger the start condition anyway, so we don't need an explicit case.
         }
 
         if (currentApp != null) {
-            addDuration(records, currentApp, startTime, Math.min(System.currentTimeMillis(), queryEnd), start, end);
+            addSession(sessions, currentApp, startTime, Math.min(System.currentTimeMillis(), queryEnd), start, end);
         }
 
         java.util.Set<String> excluded = excludedPackages(context);
         android.content.pm.PackageManager pm = context.getPackageManager();
-        java.util.List<AppUsageRecord> list = new java.util.ArrayList<>();
-        for (AppUsageRecord record : records.values()) {
-            if (record.durationMs < MIN_DURATION_MS) continue;
-            if (excluded.contains(record.packageName)) continue;
-            populateAppInfo(pm, record);
-            list.add(record);
+        java.util.List<SessionRecord> filteredList = new java.util.ArrayList<>();
+        
+        for (SessionRecord session : sessions) {
+            if (session.durationMs < MIN_DURATION_MS) continue;
+            if (excluded.contains(session.packageName)) continue;
+            populateAppInfo(pm, session);
+            filteredList.add(session);
         }
 
-        java.util.Collections.sort(list, new java.util.Comparator<AppUsageRecord>() {
+        java.util.Collections.sort(filteredList, new java.util.Comparator<SessionRecord>() {
             @Override
-            public int compare(AppUsageRecord a, AppUsageRecord b) {
-                int byDuration = Long.compare(b.durationMs, a.durationMs);
-                if (byDuration != 0) return byDuration;
-                return a.appName.compareToIgnoreCase(b.appName);
+            public int compare(SessionRecord a, SessionRecord b) {
+                return Long.compare(a.sessionStartMs, b.sessionStartMs);
             }
         });
 
-        return list;
+        return filteredList;
+    }
+
+    private static void addSession(
+            java.util.List<SessionRecord> sessions,
+            String pkg,
+            long activeStart,
+            long activeEnd,
+            long rangeStart,
+            long rangeEnd
+    ) {
+        long clampedStart = Math.max(activeStart, rangeStart);
+        long clampedEnd = Math.min(activeEnd, rangeEnd);
+        if (clampedEnd > clampedStart) {
+            sessions.add(new SessionRecord(pkg, clampedStart, clampedEnd, clampedEnd - clampedStart));
+        }
     }
 
     private static final class MasterRecord {
         final String dateKey;
-        final AppUsageRecord record;
+        final SessionRecord session;
 
-        MasterRecord(String dateKey, AppUsageRecord record) {
+        MasterRecord(String dateKey, SessionRecord session) {
             this.dateKey = dateKey;
-            this.record = record;
+            this.session = session;
         }
+    }
+
+    private static String formatIsoTime(long millis) {
+        SimpleDateFormat format = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US);
+        format.setTimeZone(TimeZone.getDefault());
+        String dateStr = format.format(new Date(millis));
+        
+        int offsetMillis = TimeZone.getDefault().getOffset(millis);
+        int offsetHours = Math.abs(offsetMillis / 3600000);
+        int offsetMinutes = Math.abs((offsetMillis / 60000) % 60);
+        String sign = offsetMillis >= 0 ? "+" : "-";
+        return String.format(Locale.US, "%s%s%02d:%02d", dateStr, sign, offsetHours, offsetMinutes);
     }
 
     private static void writeMasterCsv(File file, List<MasterRecord> masterList) throws Exception {
         StringBuilder sb = new StringBuilder();
         sb.append('\uFEFF');
-        sb.append("date,app_name,category,package_name,duration_seconds,duration_formatted,launch_count\n");
+        sb.append("date,app_name,category,package_name,session_start,session_end,duration_seconds\n");
 
         for (MasterRecord item : masterList) {
             sb.append(csv(item.dateKey)).append(',')
-                    .append(csv(item.record.appName)).append(',')
-                    .append(csv(item.record.category)).append(',')
-                    .append(csv(item.record.packageName)).append(',')
-                    .append(item.record.durationMs / 1000L).append(',')
-                    .append(csv(formatDurationHHMMSS(item.record.durationMs))).append(',')
-                    .append(item.record.launches).append('\n');
+                    .append(csv(item.session.appName)).append(',')
+                    .append(csv(item.session.category)).append(',')
+                    .append(csv(item.session.packageName)).append(',')
+                    .append(csv(formatIsoTime(item.session.sessionStartMs))).append(',')
+                    .append(csv(formatIsoTime(item.session.sessionEndMs))).append(',')
+                    .append(item.session.durationMs / 1000L).append('\n');
         }
 
-        atomicWrite(file, sb.toString());
-    }
-
-    private static void writeMasterJson(File file, List<MasterRecord> masterList) throws Exception {
-        StringBuilder sb = new StringBuilder();
-        sb.append("{\n");
-        sb.append("  \"updated_at\": \"").append(json(dateKey(System.currentTimeMillis()))).append("\",\n");
-        sb.append("  \"records_count\": ").append(masterList.size()).append(",\n");
-        sb.append("  \"records\": [\n");
-        for (int i = 0; i < masterList.size(); i++) {
-            MasterRecord item = masterList.get(i);
-            sb.append("    {\n");
-            sb.append("      \"date\": \"").append(json(item.dateKey)).append("\",\n");
-            sb.append("      \"app_name\": \"").append(json(item.record.appName)).append("\",\n");
-            sb.append("      \"category\": \"").append(json(item.record.category)).append("\",\n");
-            sb.append("      \"package_name\": \"").append(json(item.record.packageName)).append("\",\n");
-            sb.append("      \"duration_seconds\": ").append(item.record.durationMs / 1000L).append(",\n");
-            sb.append("      \"duration_formatted\": \"").append(json(formatDurationHHMMSS(item.record.durationMs))).append("\",\n");
-            sb.append("      \"launch_count\": ").append(item.record.launches).append('\n');
-            sb.append("    }");
-            if (i < masterList.size() - 1) sb.append(',');
-            sb.append('\n');
-        }
-        sb.append("  ]\n");
-        sb.append("}\n");
-        atomicWrite(file, sb.toString());
-    }
-
-    private static void writeMasterTxt(File file, List<MasterRecord> masterList) throws Exception {
-        StringBuilder sb = new StringBuilder();
-        sb.append("Screen Time Master Report — Updated ").append(dateKey(System.currentTimeMillis())).append("\n\n");
-        for (MasterRecord item : masterList) {
-            sb.append(item.dateKey)
-                    .append(" | ")
-                    .append(item.record.appName)
-                    .append(" [").append(item.record.category).append("] | ")
-                    .append(formatDurationHHMMSS(item.record.durationMs))
-                    .append(" | launches: ")
-                    .append(item.record.launches)
-                    .append('\n');
-        }
         atomicWrite(file, sb.toString());
     }
 
@@ -405,7 +415,7 @@ final class UsageReportGenerator {
 
     static final class ReportResult {
         final String dayKey;
-        final int appCount;
+        final int sessionCount;
         final long totalMs;
         final File csvFile;
         final File jsonFile;
@@ -413,66 +423,19 @@ final class UsageReportGenerator {
 
         ReportResult(
                 String dayKey,
-                int appCount,
+                int sessionCount,
                 long totalMs,
                 File csvFile,
                 File jsonFile,
                 File textFile
         ) {
             this.dayKey = dayKey;
-            this.appCount = appCount;
+            this.sessionCount = sessionCount;
             this.totalMs = totalMs;
             this.csvFile = csvFile;
             this.jsonFile = jsonFile;
             this.textFile = textFile;
         }
-    }
-    private static void addDuration(
-            java.util.Map<String, AppUsageRecord> records,
-            String pkg,
-            long activeStart,
-            long activeEnd,
-            long rangeStart,
-            long rangeEnd
-    ) {
-        long clampedStart = Math.max(activeStart, rangeStart);
-        long clampedEnd = Math.min(activeEnd, rangeEnd);
-        if (clampedEnd > clampedStart) {
-            getRecord(records, pkg).durationMs += clampedEnd - clampedStart;
-        }
-    }
-
-    private static AppUsageRecord getRecord(java.util.Map<String, AppUsageRecord> records, String pkg) {
-        AppUsageRecord record = records.get(pkg);
-        if (record == null) {
-            record = new AppUsageRecord(pkg);
-            records.put(pkg, record);
-        }
-        return record;
-    }
-
-    private static boolean isForegroundEvent(int type) {
-        return type == android.app.usage.UsageEvents.Event.MOVE_TO_FOREGROUND;
-    }
-
-    private static boolean isBackgroundEvent(int type) {
-        return type == android.app.usage.UsageEvents.Event.MOVE_TO_BACKGROUND;
-    }
-
-    private static void closeAllActive(
-            java.util.Map<String, AppUsageRecord> records,
-            java.util.Map<String, Long> activePackages,
-            long closeAt,
-            long rangeStart,
-            long rangeEnd
-    ) {
-        for (java.util.Map.Entry<String, Long> entry : activePackages.entrySet()) {
-            long activeStart = entry.getValue();
-            if (activeStart >= 0L) {
-                addDuration(records, entry.getKey(), activeStart, closeAt, rangeStart, rangeEnd);
-            }
-        }
-        activePackages.clear();
     }
 
     private static java.util.Set<String> excludedPackages(android.content.Context context) {
@@ -489,7 +452,7 @@ final class UsageReportGenerator {
         return excluded;
     }
 
-    private static void populateAppInfo(android.content.pm.PackageManager pm, AppUsageRecord record) {
+    private static void populateAppInfo(android.content.pm.PackageManager pm, SessionRecord record) {
         try {
             android.content.pm.ApplicationInfo info = pm.getApplicationInfo(record.packageName, 0);
             CharSequence label = pm.getApplicationLabel(info);
@@ -516,4 +479,3 @@ final class UsageReportGenerator {
         }
     }
 }
-

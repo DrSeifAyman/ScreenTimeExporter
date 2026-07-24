@@ -4,6 +4,7 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.util.Log;
+import androidx.core.content.ContextCompat;
 
 /**
  * Receives alarm broadcasts and delegates heavy work to ReportService.
@@ -34,6 +35,6 @@ public final class DailyReportReceiver extends BroadcastReceiver {
 
         Intent serviceIntent = new Intent(context, ReportService.class);
         serviceIntent.setAction(serviceAction);
-        context.startService(serviceIntent);
+        ContextCompat.startForegroundService(context, serviceIntent);
     }
 }

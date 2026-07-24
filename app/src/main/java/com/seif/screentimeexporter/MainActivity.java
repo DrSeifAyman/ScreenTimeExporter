@@ -547,11 +547,37 @@ public final class MainActivity extends Activity {
 
         long nextLocal = ReportScheduler.getNextAlarmMs(this, false);
         long nextDrive = ReportScheduler.getNextAlarmMs(this, true);
+        long nextInterval = ReportScheduler.getNextIntervalMs(this);
 
         String nextLocalStr = nextLocal > 0L ? DateFormat.format("MM-dd HH:mm", new Date(nextLocal)).toString() : "Not set";
         String nextDriveStr = nextDrive > 0L ? DateFormat.format("MM-dd HH:mm", new Date(nextDrive)).toString() : "Not set";
 
+        // Calculate "Next Sync" - the soonest upcoming event
+        long soonest = Long.MAX_VALUE;
+        String soonestLabel = "";
+        if (nextLocal > 0L && nextLocal < soonest) { soonest = nextLocal; soonestLabel = "Local"; }
+        if (nextDrive > 0L && nextDrive < soonest) { soonest = nextDrive; soonestLabel = "Drive"; }
+        if (nextInterval > System.currentTimeMillis() && nextInterval < soonest) { soonest = nextInterval; soonestLabel = "Interval"; }
+        String nextSyncStr = soonest < Long.MAX_VALUE
+                ? soonestLabel + " @ " + DateFormat.format("MM-dd HH:mm", new Date(soonest))
+                : "Not scheduled";
+
+        // Last successful timestamps
+        long lastLocalMs = ReportScheduler.getLastLocalSuccessTime(this);
+        long lastDriveMs = GoogleDriveUploader.getLastUploadSuccessTime(this);
+        String lastLocalStr = lastLocalMs > 0L
+                ? DateFormat.format("yyyy-MM-dd HH:mm", new Date(lastLocalMs)).toString()
+                : "Never";
+        String lastDriveStr = lastDriveMs > 0L
+                ? DateFormat.format("yyyy-MM-dd HH:mm", new Date(lastDriveMs)).toString()
+                : "Never";
+
         String driveStatus = GoogleDriveUploader.getLastUploadStatus(this);
+
+        String lastLocalError = ReportScheduler.getLastLocalError(this);
+        String lastDriveError = ReportScheduler.getLastDriveError(this);
+        String localErrorStr = !lastLocalError.isEmpty() ? "\n\u274C Local Error: " + lastLocalError : "";
+        String driveErrorStr = !lastDriveError.isEmpty() ? "\n\u274C Drive Error: " + lastDriveError : "";
 
         GoogleSignInAccount account = GoogleSignIn.getLastSignedInAccount(this);
 
@@ -569,56 +595,97 @@ public final class MainActivity extends Activity {
             emailView.setTextColor(ACCENT_RED);
         }
 
-        // Today's usage summary
-        long todayTotalMs = 0L;
-        List<AppUsageRecord> todayApps = UsageReportGenerator.getTodayTopApps(this);
-        StringBuilder topAppsText = new StringBuilder();
-        int rank = 1;
-        for (AppUsageRecord app : todayApps) {
-            todayTotalMs += app.durationMs;
-            if (rank <= 5) {
-                topAppsText.append(rank).append(". ")
-                        .append(app.appName).append("  ")
-                        .append(UsageReportGenerator.formatDuration(app.durationMs))
-                        .append("\n");
-                rank++;
-            }
-        }
-
-        String usageSummary = todayApps.isEmpty()
-                ? "Calculating..."
-                : "Today: " + UsageReportGenerator.formatDuration(todayTotalMs) + "\n\n" + topAppsText;
-
-        // Sync status indicator
-        if (driveStatus.contains("successfully") || driveStatus.contains("Uploaded")) {
-             syncStatusView.setTextColor(ACCENT_GREEN);
-             syncStatusView.setText("Last Sync: " + driveStatus + " \u2705");
-        } else if (driveStatus.contains("No upload")) {
-             syncStatusView.setTextColor(TEXT_SECONDARY);
-             syncStatusView.setText("Last Sync: " + driveStatus);
-        } else {
-             syncStatusView.setTextColor(ACCENT_AMBER);
-             syncStatusView.setText("Last Sync: " + driveStatus + " \u23f3");
-        }
-
+        // Temporary summary while loading
+        String usageSummary = "Today: Calculating...";
+        
+        // Setup initial text
         String ok = " [OK]";
         String no = " [X]";
-
         String intervalStr = ReportScheduler.isIntervalEnabled(this)
                 ? "Every " + ReportScheduler.getIntervalHours(this) + "h"
                 : "Off";
+        String nextIntervalStr = "";
+        if (ReportScheduler.isIntervalEnabled(this) && nextInterval > System.currentTimeMillis()) {
+            nextIntervalStr = "\nNext Interval: " + DateFormat.format("MM-dd HH:mm", new Date(nextInterval));
+        }
 
-        statusView.setText(
-                usageSummary +
+        Runnable updateText = () -> {
+            // This is updated again below once apps are loaded
+            statusView.setText(
+                "Today: Calculating...\n\n" +
                 "\n" +
                 "Usage Access:" + (usage ? ok : no) + "\n" +
                 "Storage Access:" + (storage ? ok : no) + "\n" +
                 "Battery Opt. Off:" + (ignoringBattery ? ok : no) + "\n" +
                 "\n" +
+                "\u23F0 Next Sync: " + nextSyncStr + "\n" +
                 "Next Local: " + nextLocalStr + "\n" +
                 "Next Drive: " + nextDriveStr + "\n" +
-                "Interval Sync: " + intervalStr
-        );
+                "Interval Sync: " + intervalStr +
+                nextIntervalStr + "\n" +
+                "\n" +
+                "\u2705 Last Local: " + lastLocalStr +
+                localErrorStr + "\n" +
+                "\u2705 Last Drive: " + lastDriveStr +
+                driveErrorStr
+            );
+        };
+        updateText.run();
+
+        // Fetch usage asynchronously
+        executor.execute(() -> {
+            long todayTotalMs = 0L;
+            List<AppUsageRecord> todayApps = UsageReportGenerator.getTodayTopApps(this);
+            StringBuilder topAppsText = new StringBuilder();
+            int rank = 1;
+            for (AppUsageRecord app : todayApps) {
+                todayTotalMs += app.durationMs;
+                if (rank <= 5) {
+                    topAppsText.append(rank).append(". ")
+                            .append(app.appName).append("  ")
+                            .append(UsageReportGenerator.formatDuration(app.durationMs))
+                            .append("\n");
+                    rank++;
+                }
+            }
+
+            String finalUsageSummary = todayApps.isEmpty()
+                    ? "Today: No usage data"
+                    : "Today: " + UsageReportGenerator.formatDuration(todayTotalMs) + "\n\n" + topAppsText;
+
+            runOnUiThread(() -> {
+                // Sync status indicator
+                if (driveStatus.contains("successfully") || driveStatus.contains("Uploaded")) {
+                     syncStatusView.setTextColor(ACCENT_GREEN);
+                     syncStatusView.setText("Last Sync: " + lastDriveStr + " \u2705");
+                } else if (driveStatus.contains("No upload")) {
+                     syncStatusView.setTextColor(TEXT_SECONDARY);
+                     syncStatusView.setText("Last Sync: Never");
+                } else {
+                     syncStatusView.setTextColor(ACCENT_AMBER);
+                     syncStatusView.setText("Last Sync: " + driveStatus + " \u23f3");
+                }
+
+                statusView.setText(
+                    finalUsageSummary +
+                    "\n" +
+                    "Usage Access:" + (usage ? ok : no) + "\n" +
+                    "Storage Access:" + (storage ? ok : no) + "\n" +
+                    "Battery Opt. Off:" + (ignoringBattery ? ok : no) + "\n" +
+                    "\n" +
+                    "\u23F0 Next Sync: " + nextSyncStr + "\n" +
+                    "Next Local: " + nextLocalStr + "\n" +
+                    "Next Drive: " + nextDriveStr + "\n" +
+                    "Interval Sync: " + intervalStr +
+                    nextIntervalStr + "\n" +
+                    "\n" +
+                    "\u2705 Last Local: " + lastLocalStr +
+                    localErrorStr + "\n" +
+                    "\u2705 Last Drive: " + lastDriveStr +
+                    driveErrorStr
+                );
+            });
+        });
     }
 
     // ════════════════════════════════════════════════
